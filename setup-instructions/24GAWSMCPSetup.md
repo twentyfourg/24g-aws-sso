@@ -1,12 +1,12 @@
 # Set Up the AWS MCP Server for 24G Agents
 
-Version: 0.1.0
+<!-- semantic-release-version-start -->
+Version: 1.0.0
 Updated: 2026-09-21
+<!-- semantic-release-version-end -->
 Repository: <https://github.com/twentyfourg/24g-aws-sso>
 
-You MUST report the version above to the user at the start of a run. Bump the
-patch number for wording or troubleshooting changes and the minor number when a
-command or step changes.
+You MUST report the version above to the user at the start of a run.
 
 ## Overview
 
