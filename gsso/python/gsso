@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # semantic-release-version-start
-VERSION = "0.8.0"
+VERSION = "1.0.0"
 # semantic-release-version-end
 
 SESSION_NAME = "24g"
