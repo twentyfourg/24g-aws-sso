@@ -1,6 +1,6 @@
 # Set Up Local AWS Configuration and Credentials for 24G
 
-Version: 0.3.3
+Version: 0.3.4
 Updated: 2026-09-21
 Repository: <https://github.com/twentyfourg/24g-aws-sso>
 
@@ -748,7 +748,7 @@ The `rmdir` removes the parent only when it is empty, so backups from earlier ru
 
 ## Step 12: Optional `gsso` helper commands
 
-Specified but not yet built. See [`24GCLISpec.md`](24GCLISpec.md).
+Specified but not yet built. See [`gsso/24GCLISpec.md`](../gsso/24GCLISpec.md).
 
 When it exists, this step will offer to install an optional `gsso` script providing `login`, `list`, `add`, `remove`, and `switch`. It is genuinely optional: every profile written by Step 9 already works with plain `aws --profile <name>`.
 
@@ -927,13 +927,13 @@ https://github.com/twentyfourg/24g-aws-sso/issues/new?template=setup-failure.md
 
 ### Troubleshooting: Step 5 (Configure the SSO session and sign in)
 
-| Symptom                                                     | Cause                                                                         | Resolution                                                                                                                              |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `Unknown component: sso-session` or the section is ignored  | AWS CLI v1                                                                    | Go back to Step 2 and install v2                                                                                                        |
-| Browser does not open                                       | Headless environment, no default browser, or a remote/SSH session             | Re-run with `aws sso login --sso-session 24g --no-browser` and give the user the verification URL and code to open on their own machine |
-| `aws sso login` exits non-zero                              | The user closed the browser or the request timed out                          | Re-run the command and let the user finish the browser flow                                                                             |
-| Browser shows an authorization or access error              | The user's identity is not assigned to the Identity Center instance           | This is not fixable locally. Tell the user to contact whoever administers AWS access                                                    |
-| Sign-in succeeds but no file appears in `~/.aws/sso/cache/` | `AWS_CONFIG_FILE` or a non-standard `HOME` is redirecting the cache           | Check those environment variables and locate the real cache directory before Step 6                                                     |
+| Symptom                                                     | Cause                                                               | Resolution                                                                                                                              |
+| ----------------------------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `Unknown component: sso-session` or the section is ignored  | AWS CLI v1                                                          | Go back to Step 2 and install v2                                                                                                        |
+| Browser does not open                                       | Headless environment, no default browser, or a remote/SSH session   | Re-run with `aws sso login --sso-session 24g --no-browser` and give the user the verification URL and code to open on their own machine |
+| `aws sso login` exits non-zero                              | The user closed the browser or the request timed out                | Re-run the command and let the user finish the browser flow                                                                             |
+| Browser shows an authorization or access error              | The user's identity is not assigned to the Identity Center instance | This is not fixable locally. Tell the user to contact whoever administers AWS access                                                    |
+| Sign-in succeeds but no file appears in `~/.aws/sso/cache/` | `AWS_CONFIG_FILE` or a non-standard `HOME` is redirecting the cache | Check those environment variables and locate the real cache directory before Step 6                                                     |
 
 ### Troubleshooting: Step 6 (Read the access token)
 
@@ -958,13 +958,13 @@ https://github.com/twentyfourg/24g-aws-sso/issues/new?template=setup-failure.md
 
 ### Troubleshooting: Step 8 (Propose profile names)
 
-| Symptom                                                           | Cause                                                                                                                | Resolution                                                                                                              |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Two generated names are identical                                 | The same project role name exists in multiple accounts                                                               | Prefix both with the account name, per the collision rule                                                               |
-| A generated name matches an existing, unmanaged profile           | The user already hand-wrote a profile with that name, in either `config` or `credentials`                            | Do not overwrite, and do not edit `credentials`. Show the existing section and ask for a different name                 |
+| Symptom                                                                | Cause                                                                                                                | Resolution                                                                                                              |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Two generated names are identical                                      | The same project role name exists in multiple accounts                                                               | Prefix both with the account name, per the collision rule                                                               |
+| A generated name matches an existing, unmanaged profile                | The user already hand-wrote a profile with that name, in either `config` or `credentials`                            | Do not overwrite, and do not edit `credentials`. Show the existing section and ask for a different name                 |
 | `aws configure list-profiles` shows a name like `profile example-prod` | A section in `~/.aws/credentials` was written with the `[profile name]` header form, which is only valid in `config` | Pre-existing and out of scope here. Report it to the user; do not fix it as part of this setup                          |
-| A role name does not clearly fit either category                  | Naming convention drift in Identity Center                                                                           | Show the role to the user with both candidate names and let them choose                                                 |
-| An account name contains spaces or unusual characters             | Account naming in Identity Center                                                                                    | Replace whitespace with `-` and strip characters outside `[A-Za-z0-9._-]`. Show the result to the user for confirmation |
+| A role name does not clearly fit either category                       | Naming convention drift in Identity Center                                                                           | Show the role to the user with both candidate names and let them choose                                                 |
+| An account name contains spaces or unusual characters                  | Account naming in Identity Center                                                                                    | Replace whitespace with `-` and strip characters outside `[A-Za-z0-9._-]`. Show the result to the user for confirmation |
 
 ### Troubleshooting: Step 9 (Write the profiles)
 
@@ -972,7 +972,7 @@ https://github.com/twentyfourg/24g-aws-sso/issues/new?template=setup-failure.md
 | ------------------------------------------------------------------ | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | Profile written but `aws configure list-profiles` does not show it | Wrote to the wrong file, or a syntax error in the section header | Confirm the header is `[profile <name>]` in `config` — the bare `[<name>]` form is only valid in `credentials` |
 | Re-run produced duplicate sections                                 | The existing section was appended to instead of updated          | Remove the duplicate, keep the one with the managed marker, and re-apply with `aws configure set`              |
-| Comments or hand-written sections disappeared                      | The file was rewritten wholesale instead of edited in place      | [Roll back](#roll-back), then redo the step using `aws configure set`                             |
+| Comments or hand-written sections disappeared                      | The file was rewritten wholesale instead of edited in place      | [Roll back](#roll-back), then redo the step using `aws configure set`                                          |
 
 ### Troubleshooting: Step 10 (Verify)
 
@@ -985,9 +985,9 @@ https://github.com/twentyfourg/24g-aws-sso/issues/new?template=setup-failure.md
 
 ### Troubleshooting: Step 11 (Confirm the result and clean up)
 
-| Symptom                                       | Cause                                                                     | Resolution                                                                                                                              |
-| --------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| No rollback directory found                   | The run made no changes, or the rollback point was never created          | If the run wrote anything, that is a process failure worth reporting. Either way there is nothing to clean up                           |
-| Several rollback directories exist            | Earlier runs were never cleaned up                                        | List them with their timestamps and ask which to remove. Only this run's directory is safe to delete without asking                     |
-| Permission denied removing the directory      | Ownership or permissions on `~/.aws`                                      | Show `ls -la ~/.aws/.24g-setup-backups/` and let the user remove it themselves. Do not escalate with `sudo`                              |
-| The user is unsure whether the setup is right | Reasonable, and nothing is broken                                         | Leave the rollback point in place. Tell them where it is and how to restore from it. Keeping it costs nothing                           |
+| Symptom                                       | Cause                                                            | Resolution                                                                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| No rollback directory found                   | The run made no changes, or the rollback point was never created | If the run wrote anything, that is a process failure worth reporting. Either way there is nothing to clean up       |
+| Several rollback directories exist            | Earlier runs were never cleaned up                               | List them with their timestamps and ask which to remove. Only this run's directory is safe to delete without asking |
+| Permission denied removing the directory      | Ownership or permissions on `~/.aws`                             | Show `ls -la ~/.aws/.24g-setup-backups/` and let the user remove it themselves. Do not escalate with `sudo`         |
+| The user is unsure whether the setup is right | Reasonable, and nothing is broken                                | Leave the rollback point in place. Tell them where it is and how to restore from it. Keeping it costs nothing       |
