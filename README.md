@@ -239,4 +239,5 @@ Do not paste an SSO access token into an issue. The diagnostics the agent collec
 | `setup-instructions/24GAWSSOSetup.md`     | Configures AWS CLI access through 24G IAM Identity Center                      |
 | `setup-instructions/24GAWSMCPSetup.md`    | Configures approved AWS profiles for local AI agents through the AWS MCP proxy |
 | `.github/ISSUE_TEMPLATE/setup-failure.md` | Issue template for a setup error with no documented resolution                 |
+| `gsso/README.md`                          | Usage for the optional `gsso` helper                                           |
 | `gsso/python/gsso`                        | Optional `gsso` helper for login, profile switching, and MCP allowlist edits   |
