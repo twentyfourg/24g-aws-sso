@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""gsso - 24G AWS SSO profile helper.
+
+Implements 24GCLISpec.md for macOS and Linux. Standard library only; every AWS
+call shells out to the AWS CLI v2.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+VERSION = "0.6.0"
+
+SESSION_NAME = "24g"
+SSO_START_URL = "https://24glogin.awsapps.com/start"
+SSO_REGION = "us-east-1"
+DEFAULT_REGION = "us-east-1"
+
+MANAGED_MARKER = "# managed-by: 24g-sso-setup"
+ACCOUNT_NAME_KEY = "# account-name:"
+
+AWS_DIR = Path.home() / ".aws"
+CONFIG_PATH = AWS_DIR / "config"
+CREDENTIALS_PATH = AWS_DIR / "credentials"
+SSO_CACHE_DIR = AWS_DIR / "sso" / "cache"
+BACKUP_ROOT = AWS_DIR / ".24g-setup-backups"
+PORTAL_CACHE_PATH = AWS_DIR / "gsso" / "portal-cache.json"
+
+# Identity Center read APIs share a 20 TPS account-level throttle. Each
+# list-account-roles CLI call takes ~0.8s, so 10 in flight is about 12 TPS.
+ROLE_FETCH_CONCURRENCY = 10
+ROLE_FETCH_RETRIES = 4
+
+EX_OK = 0
+EX_FAIL = 1
+EX_DEP = 2
+EX_TTY = 3
+EX_AUTH = 4
+
+SECTION_RE = re.compile(r"^\s*\[(.+?)\]\s*$")
+SYSTEM_ROLE_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+TIMESTAMP_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*"
+    r"(Z|UTC|[+-]\d{2}:?\d{2})?$"
+)
+
+
+class GssoError(Exception):
+    """A failure with a known cause. Printed without a traceback."""
+
+    def __init__(self, message: str, code: int = EX_FAIL, fix: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.fix = fix
+
+
+def err(*parts: str) -> None:
+    """Write to stderr. stdout is reserved for the `switch` export line."""
+    print(*parts, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# Config file: a section-preserving reader/writer.
+#
+# configparser is not used because it drops comments and reformats on write,
+# and the managed marker and account name are comments.
+# --------------------------------------------------------------------------
+
+
+class Block:
+    def __init__(self, header: Optional[str], lines: List[str]):
+        self.header = header  # text inside the brackets, or None for the preamble
+        self.lines = lines  # includes the header line itself
+
+    def body(self) -> Iterable[str]:
+        return self.lines[1:] if self.header is not None else self.lines
+
+    def has_comment(self, prefix: str) -> bool:
+        return any(line.strip().startswith(prefix) for line in self.body())
+
+    def comment_value(self, prefix: str) -> Optional[str]:
+        for line in self.body():
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                return stripped[len(prefix) :].strip()
+        return None
+
+    def get(self, key: str) -> Optional[str]:
+        for line in self.body():
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith(";"):
+                continue
+            if "=" in stripped:
+                name, _, value = stripped.partition("=")
+                if name.strip() == key:
+                    return value.strip()
+        return None
+
+    def insert_comment(self, text: str) -> bool:
+        """Add a comment directly under the header. True if the file changed."""
+        if self.header is None or self.has_comment(text.split(":")[0] + ":"):
+            return False
+        self.lines.insert(1, text + "\n")
+        return True
+
+
+class ConfigFile:
+    def __init__(self, path: Path):
+        self.path = path
+        self.blocks: List[Block] = []
+        if not path.exists():
+            return
+        current = Block(None, [])
+        self.blocks.append(current)
+        for line in path.read_text().splitlines(keepends=True):
+            match = SECTION_RE.match(line)
+            if match:
+                current = Block(match.group(1).strip(), [line])
+                self.blocks.append(current)
+            else:
+                current.lines.append(line)
+
+    def sections(self) -> List[Block]:
+        return [b for b in self.blocks if b.header is not None]
+
+    def section(self, header: str) -> Optional[Block]:
+        for block in self.sections():
+            if block.header == header:
+                return block
+        return None
+
+    def ensure_blank_line_before(self, header: str) -> bool:
+        """`aws configure set` appends sections flush against the previous one."""
+        for i, block in enumerate(self.blocks):
+            if block.header == header and i > 0:
+                previous = self.blocks[i - 1]
+                if previous.lines and previous.lines[-1].strip() != "":
+                    previous.lines.append("\n")
+                    return True
+        return False
+
+    def remove_section(self, header: str) -> bool:
+        for i, block in enumerate(self.blocks):
+            if block.header == header:
+                del self.blocks[i]
+                return True
+        return False
+
+    def render(self) -> str:
+        return "".join(line for block in self.blocks for line in block.lines)
+
+    def save(self) -> None:
+        atomic_write(self.path, self.render())
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".gsso-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+# --------------------------------------------------------------------------
+# Rollback
+# --------------------------------------------------------------------------
+
+
+def create_rollback_point() -> Path:
+    """Copy the files this script may change. Same format as 24GAWSSOSetup.md."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = BACKUP_ROOT / stamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    if CONFIG_PATH.exists():
+        shutil.copy2(CONFIG_PATH, backup_dir / "config")
+        manifest.append(f"config\t{CONFIG_PATH}")
+    else:
+        manifest.append(f"ABSENT\t{CONFIG_PATH}")
+    (backup_dir / "manifest.tsv").write_text("\n".join(manifest) + "\n")
+    return backup_dir
+
+
+# --------------------------------------------------------------------------
+# AWS CLI
+# --------------------------------------------------------------------------
+
+
+def require_aws() -> None:
+    if shutil.which("aws") is None:
+        raise GssoError(
+            "the AWS CLI is not on PATH",
+            EX_DEP,
+            "install AWS CLI v2, then re-run",
+        )
+    out = subprocess.run(
+        ["aws", "--version"], capture_output=True, text=True
+    ).stdout.strip()
+    if not out.startswith("aws-cli/2"):
+        raise GssoError(
+            f"AWS CLI v2 is required, found: {out or 'unknown'}",
+            EX_DEP,
+            "sso-session configuration needs v2; upgrade and re-run",
+        )
+
+
+def run_aws(args: Sequence[str], secret: Optional[str] = None) -> str:
+    """Run an aws subcommand and return stdout.
+
+    `secret` is redacted from any error text before it is raised, because the
+    SSO access token is passed to some commands as an argument and would
+    otherwise reach the user through the failure message.
+    """
+    proc = subprocess.run(
+        ["aws", *args, "--no-cli-pager"], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        if secret:
+            detail = detail.replace(secret, "<redacted>")
+        raise GssoError(f"aws {' '.join(redact_args(args, secret))} failed: {detail}")
+    return proc.stdout
+
+
+def redact_args(args: Sequence[str], secret: Optional[str]) -> List[str]:
+    if not secret:
+        return list(args)
+    return ["<redacted>" if a == secret else a for a in args]
+
+
+def aws_configure_set(key: str, value: str) -> None:
+    subprocess.run(["aws", "configure", "set", key, value], check=True)
+
+
+# --------------------------------------------------------------------------
+# SSO token
+# --------------------------------------------------------------------------
+
+
+def parse_timestamp(raw: str) -> Optional[datetime]:
+    """Parse the three expiresAt shapes the CLI has written over time."""
+    match = TIMESTAMP_RE.match(raw.strip())
+    if not match:
+        return None
+    year, month, day, hour, minute, second, fraction, offset = match.groups()
+    micro = int((fraction or "0").ljust(6, "0")[:6])
+    if offset in (None, "Z", "UTC"):
+        tz = timezone.utc
+    else:
+        tz = datetime.strptime(offset.replace(":", ""), "%z").tzinfo
+    return datetime(
+        int(year), int(month), int(day), int(hour), int(minute), int(second), micro, tz
+    )
+
+
+def load_access_token() -> str:
+    """Return the newest unexpired 24G token. Never log or print the value."""
+    if not SSO_CACHE_DIR.is_dir():
+        raise GssoError("no SSO cache directory", EX_AUTH, "run `gsso login`")
+    best: Optional[Tuple[datetime, str]] = None
+    now = datetime.now(timezone.utc)
+    for path in SSO_CACHE_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (ValueError, OSError):
+            continue  # client registration files and partial writes
+        if not isinstance(data, dict):
+            continue
+        token = data.get("accessToken")
+        if not token or data.get("startUrl") != SSO_START_URL:
+            continue
+        expires = parse_timestamp(str(data.get("expiresAt", "")))
+        if expires is None or expires <= now:
+            continue
+        if best is None or expires > best[0]:
+            best = (expires, token)
+    if best is None:
+        raise GssoError(
+            "no valid 24G SSO session", EX_AUTH, "run `gsso login`"
+        )
+    return best[1]
+
+
+# --------------------------------------------------------------------------
+# Profiles
+# --------------------------------------------------------------------------
+
+
+class Profile:
+    def __init__(
+        self,
+        name: str,
+        account_id: Optional[str] = None,
+        account_name: Optional[str] = None,
+        role_name: Optional[str] = None,
+        managed: bool = False,
+    ):
+        self.name = name
+        self.account_id = account_id
+        self.account_name = account_name
+        self.role_name = role_name
+        self.managed = managed
+
+
+def read_config_profiles() -> List[Profile]:
+    config = ConfigFile(CONFIG_PATH)
+    profiles = []
+    for block in config.sections():
+        if not block.header.startswith("profile "):
+            continue
+        profiles.append(
+            Profile(
+                name=block.header[len("profile ") :].strip(),
+                account_id=block.get("sso_account_id"),
+                account_name=block.comment_value(ACCOUNT_NAME_KEY),
+                role_name=block.get("sso_role_name"),
+                managed=block.has_comment(MANAGED_MARKER),
+            )
+        )
+    return profiles
+
+
+def read_credentials_profile_names() -> List[str]:
+    """Section headers only. Values in this file are never read."""
+    if not CREDENTIALS_PATH.exists():
+        return []
+    names = []
+    for line in CREDENTIALS_PATH.read_text().splitlines():
+        match = SECTION_RE.match(line)
+        if match:
+            names.append(match.group(1).strip())
+    return names
+
+
+def sanitize(part: str) -> str:
+    part = re.sub(r"\s+", "-", part.strip())
+    part = re.sub(r"[^A-Za-z0-9._-]", "", part)
+    return re.sub(r"-{2,}", "-", part).strip("-")
+
+
+def proposed_name(account_name: str, role_name: str, shared_roles: set) -> str:
+    """System roles and roles present in several accounts get an account prefix."""
+    account = sanitize(account_name)
+    role = sanitize(role_name)
+    if SYSTEM_ROLE_RE.match(role) or role_name in shared_roles:
+        return f"{account}-{role}"
+    return role
+
+
+def shared_role_names(pairs: Sequence[Tuple[str, str, str]]) -> set:
+    counts: Dict[str, set] = {}
+    for account_id, _account_name, role_name in pairs:
+        counts.setdefault(role_name, set()).add(account_id)
+    return {role for role, accounts in counts.items() if len(accounts) > 1}
+
+
+def fetch_account_roles(token: str, account_id: str) -> List[dict]:
+    """List roles in one account. Retry on the Identity Center read throttle."""
+    delay = 0.5
+    last: Optional[GssoError] = None
+    for _ in range(ROLE_FETCH_RETRIES):
+        try:
+            data = json.loads(
+                run_aws(
+                    [
+                        "sso",
+                        "list-account-roles",
+                        "--access-token",
+                        token,
+                        "--region",
+                        SSO_REGION,
+                        "--account-id",
+                        account_id,
+                    ],
+                    secret=token,
+                )
+            )
+            return data.get("roleList", [])
+        except GssoError as error:
+            last = error
+            if "TooManyRequests" not in str(error):
+                raise
+            time.sleep(delay)
+            delay *= 2
+    assert last is not None
+    raise last
+
+
+def fetch_remote_pairs(token: str) -> List[Tuple[str, str, str]]:
+    """Return (account_id, account_name, role_name) for everything the user has."""
+    accounts = json.loads(
+        run_aws(
+            ["sso", "list-accounts", "--access-token", token, "--region", SSO_REGION],
+            secret=token,
+        )
+    ).get("accountList", [])
+    if not accounts:
+        return []
+    workers = min(ROLE_FETCH_CONCURRENCY, len(accounts))
+    err(f"Listing roles in {len(accounts)} accounts ({workers} at a time)")
+    pairs: List[Tuple[str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {
+            pool.submit(fetch_account_roles, token, account["accountId"]): account
+            for account in accounts
+        }
+        for future in as_completed(pending):
+            account = pending[future]
+            account_id = account["accountId"]
+            account_name = account.get("accountName") or account_id
+            for role in future.result():
+                pairs.append((account_id, account_name, role["roleName"]))
+    return pairs
+
+
+def read_portal_cache() -> Optional[Tuple[str, List[Tuple[str, str, str]]]]:
+    """Return (fetchedAt, pairs) or None if the cache is missing or unusable.
+
+    The file stores account and role names only. Never a token.
+    """
+    if not PORTAL_CACHE_PATH.exists():
+        return None
+    try:
+        data = json.loads(PORTAL_CACHE_PATH.read_text())
+    except (ValueError, OSError):
+        return None
+    if data.get("startUrl") != SSO_START_URL:
+        return None
+    raw = data.get("pairs")
+    if not isinstance(raw, list):
+        return None
+    pairs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        account_id = item.get("accountId")
+        account_name = item.get("accountName")
+        role_name = item.get("roleName")
+        if not account_id or not account_name or not role_name:
+            return None
+        pairs.append((account_id, account_name, role_name))
+    fetched = str(data.get("fetchedAt") or "unknown")
+    return fetched, pairs
+
+
+def write_portal_cache(pairs: Sequence[Tuple[str, str, str]]) -> None:
+    payload = {
+        "startUrl": SSO_START_URL,
+        "fetchedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pairs": [
+            {"accountId": account_id, "accountName": account_name, "roleName": role_name}
+            for account_id, account_name, role_name in sorted(pairs)
+        ],
+    }
+    PORTAL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(PORTAL_CACHE_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+def load_remote_pairs(hard_refresh: bool) -> List[Tuple[str, str, str]]:
+    """Portal account/role matrix: cache by default, Identity Center on miss or --hard-refresh."""
+    if not hard_refresh:
+        cached = read_portal_cache()
+        if cached is not None:
+            fetched, pairs = cached
+            err(
+                f"Using portal cache from {fetched} "
+                f"({len(pairs)} roles). Refresh with --hard-refresh."
+            )
+            return pairs
+    token = load_access_token()
+    pairs = fetch_remote_pairs(token)
+    write_portal_cache(pairs)
+    err(f"Wrote {PORTAL_CACHE_PATH}")
+    return pairs
+
+
+def write_profile(
+    name: str, account_id: str, account_name: str, role_name: str, region: str
+) -> None:
+    """Write keys with `aws configure set`, then add the two comment lines."""
+    for key, value in (
+        ("sso_session", SESSION_NAME),
+        ("sso_account_id", account_id),
+        ("sso_role_name", role_name),
+        ("region", region),
+        ("output", "json"),
+    ):
+        aws_configure_set(f"profile.{name}.{key}", value)
+    config = ConfigFile(CONFIG_PATH)
+    block = config.section(f"profile {name}")
+    if block is None:
+        raise GssoError(f"wrote profile {name} but cannot find it in {CONFIG_PATH}")
+    changed = block.insert_comment(f"{ACCOUNT_NAME_KEY} {account_name}")
+    changed = block.insert_comment(MANAGED_MARKER) or changed
+    changed = config.ensure_blank_line_before(f"profile {name}") or changed
+    if changed:
+        config.save()
+
+
+def default_region() -> str:
+    block = ConfigFile(CONFIG_PATH).section("default")
+    return (block.get("region") if block else None) or DEFAULT_REGION
+
+
+# --------------------------------------------------------------------------
+# Interactive helpers
+# --------------------------------------------------------------------------
+
+
+def require_tty(what: str) -> None:
+    if not sys.stdin.isatty():
+        raise GssoError(
+            f"{what} needs an interactive terminal",
+            EX_TTY,
+            "pass the names as arguments instead",
+        )
+
+
+def choose(options: Sequence[str], prompt: str, multiple: bool) -> List[str]:
+    require_tty(prompt)
+    for i, option in enumerate(options, 1):
+        err(f"  {i:>3}. {option}")
+    err("")
+    raw = input(f"{prompt}: ") if not multiple else input(f"{prompt} (comma separated): ")
+    picks = []
+    for token in raw.replace(" ", ",").split(","):
+        if not token:
+            continue
+        if not token.isdigit() or not 1 <= int(token) <= len(options):
+            raise GssoError(f"not a valid choice: {token}")
+        picks.append(options[int(token) - 1])
+    if not picks:
+        raise GssoError("nothing selected")
+    return picks if multiple else picks[:1]
+
+
+def confirm(question: str) -> bool:
+    if not sys.stdin.isatty():
+        raise GssoError(
+            "this needs confirmation but there is no terminal",
+            EX_TTY,
+            "re-run from an interactive shell",
+        )
+    return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Renew the SSO session. Nothing more.
+
+    This deliberately does not touch profiles. Discovering newly granted roles
+    is `gsso list --remote`; creating profiles for them is `gsso add`.
+    """
+    require_aws()
+    command = ["aws", "sso", "login", "--sso-session", SESSION_NAME, *args.extra]
+    return subprocess.run(command).returncode
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    require_aws()
+    if args.remote or args.hard_refresh:
+        return list_remote(args.hard_refresh)
+    return list_local()
+
+
+def list_local() -> int:
+    config_profiles = read_config_profiles()
+    credential_names = set(read_credentials_profile_names()) - {"default"}
+    current = os.environ.get("AWS_PROFILE")
+
+    managed = [p for p in config_profiles if p.managed]
+    unmanaged = [
+        p.name for p in config_profiles if not p.managed and p.name not in credential_names
+    ]
+
+    groups: Dict[Tuple[str, str], List[Profile]] = {}
+    for profile in managed:
+        key = (profile.account_name or "(unknown account)", profile.account_id or "?")
+        groups.setdefault(key, []).append(profile)
+
+    if not groups and not credential_names and not unmanaged:
+        err("No profiles configured. Run `gsso login`.")
+        return EX_OK
+
+    width = max([len(p.name) for p in managed] + [10])
+    for (account_name, account_id) in sorted(groups):
+        print(f"{account_name} ({account_id})")
+        for profile in sorted(groups[(account_name, account_id)], key=lambda p: p.name):
+            mark = ">" if profile.name == current else " "
+            print(f"  {mark} {profile.name:<{width}}  {profile.role_name or ''}")
+        print()
+
+    if credential_names:
+        print(f"Static credential profiles ({CREDENTIALS_PATH})")
+        for name in sorted(credential_names):
+            mark = ">" if name == current else " "
+            print(f"  {mark} {name}")
+        print()
+
+    if unmanaged:
+        print(f"Unmanaged profiles ({CONFIG_PATH})")
+        for name in sorted(unmanaged):
+            mark = ">" if name == current else " "
+            print(f"  {mark} {name}")
+        print()
+    return EX_OK
+
+
+def list_remote(hard_refresh: bool) -> int:
+    pairs = load_remote_pairs(hard_refresh)
+    configured = {(p.account_id, p.role_name) for p in read_config_profiles()}
+    by_account: Dict[Tuple[str, str], List[str]] = {}
+    for account_id, account_name, role_name in pairs:
+        by_account.setdefault((account_name, account_id), []).append(role_name)
+    for (account_name, account_id) in sorted(by_account):
+        print(f"{account_name} ({account_id})")
+        for role in sorted(by_account[(account_name, account_id)]):
+            state = "configured" if (account_id, role) in configured else "not configured"
+            print(f"    {role:<34}  {state}")
+        print()
+    return EX_OK
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    require_aws()
+    pairs = load_remote_pairs(args.hard_refresh)
+    shared = shared_role_names(pairs)
+    existing = {p.name for p in read_config_profiles()}
+    configured = {(p.account_id, p.role_name) for p in read_config_profiles()}
+
+    candidates = {
+        f"{name}/{role}": (account_id, name, role)
+        for account_id, name, role in pairs
+        if (account_id, role) not in configured
+    }
+    if not candidates:
+        err("Every available role already has a profile.")
+        return EX_OK
+
+    if args.targets:
+        selected = []
+        for target in args.targets:
+            if target not in candidates:
+                raise GssoError(
+                    f"not an available, unconfigured role: {target}",
+                    fix="run `gsso list --remote` to see valid values",
+                )
+            selected.append(candidates[target])
+    else:
+        picked = choose(sorted(candidates), "Add which roles", multiple=True)
+        selected = [candidates[p] for p in picked]
+
+    backup = create_rollback_point()
+    err(f"Rollback point: {backup}")
+    region = default_region()
+    for account_id, account_name, role_name in selected:
+        name = proposed_name(account_name, role_name, shared)
+        if name in existing:
+            err(f"skipped {name}: a profile with that name already exists")
+            continue
+        write_profile(name, account_id, account_name, role_name, region)
+        existing.add(name)
+        err(f"added {name}")
+    return EX_OK
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    require_aws()
+    profiles = {p.name: p for p in read_config_profiles()}
+    managed = sorted(name for name, p in profiles.items() if p.managed)
+
+    if args.profiles:
+        targets = args.profiles
+    else:
+        if not managed:
+            err("No managed profiles to remove.")
+            return EX_OK
+        targets = choose(managed, "Remove which profiles", multiple=True)
+
+    doomed = []
+    for name in targets:
+        profile = profiles.get(name)
+        if profile is None:
+            err(f"skipped {name}: no such profile in {CONFIG_PATH}")
+        elif not profile.managed:
+            err(f"skipped {name}: not managed by this tool, so it will not be touched")
+        else:
+            doomed.append(name)
+    if not doomed:
+        return EX_FAIL
+
+    backup = create_rollback_point()
+    err(f"Rollback point: {backup}")
+    config = ConfigFile(CONFIG_PATH)
+    default_block = config.section("default")
+    default_account = default_block.get("sso_account_id") if default_block else None
+    current = os.environ.get("AWS_PROFILE")
+
+    for name in doomed:
+        config.remove_section(f"profile {name}")
+        err(f"removed {name}")
+        if name == current:
+            err(f"  note: AWS_PROFILE still points at {name} in this shell")
+        if default_account and profiles[name].account_id == default_account:
+            err("  note: [default] mirrors this profile and now references a removed role")
+    config.save()
+    return EX_OK
+
+
+def cmd_switch(args: argparse.Namespace) -> int:
+    require_aws()
+    known = [p.name for p in read_config_profiles()] + read_credentials_profile_names()
+    known = sorted({n for n in known if n != "default"})
+    if not known:
+        raise GssoError("no profiles configured", fix="run `gsso login`")
+
+    if args.profile:
+        if args.profile not in known:
+            raise GssoError(
+                f"no such profile: {args.profile}", fix="run `gsso list`"
+            )
+        target = args.profile
+    else:
+        target = choose(known, "Switch to which profile", multiple=False)[0]
+
+    if args.set_default:
+        set_default_profile(target)
+
+    if args.shell == "powershell":
+        print(f"$env:AWS_PROFILE = '{target}'")
+    else:
+        print(f"export AWS_PROFILE={target}")
+    err(f"AWS_PROFILE={target}")
+    return EX_OK
+
+
+def set_default_profile(name: str) -> None:
+    if "default" in read_credentials_profile_names():
+        err("")
+        err(f"{CREDENTIALS_PATH} has its own [default] section with static keys.")
+        err("Writing an SSO default into ~/.aws/config changes how plain `aws` behaves:")
+        err("it will attempt SSO and fail when no token exists, instead of falling back")
+        err("to those static keys. Anything relying on them will break once the session")
+        err("expires.")
+        if not confirm("Write the SSO default anyway?"):
+            raise GssoError("left [default] alone")
+
+    source = ConfigFile(CONFIG_PATH).section(f"profile {name}")
+    if source is None:
+        raise GssoError(f"{name} is not an SSO profile in {CONFIG_PATH}")
+    backup = create_rollback_point()
+    err(f"Rollback point: {backup}")
+    for key in ("sso_session", "sso_account_id", "sso_role_name", "region"):
+        value = source.get(key)
+        if value:
+            aws_configure_set(f"default.{key}", value)
+    err(f"[default] now mirrors {name}")
+
+
+def find_account_name(account_id: Optional[str]) -> Optional[str]:
+    """Best-effort account name for an id with no # account-name: of its own."""
+    if not account_id:
+        return None
+    for profile in read_config_profiles():
+        if profile.account_id == account_id and profile.account_name:
+            return profile.account_name
+    return None
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    """Show which profile is active and what identity it actually resolves to.
+
+    This calls `aws sts get-caller-identity`, not just AWS_PROFILE, so it
+    confirms the credentials really work rather than only that a `switch`
+    export happened. That distinction matters: `switch` succeeding only
+    proves the shell variable was set, not that the session behind it is
+    still valid.
+    """
+    require_aws()
+    profile_env = os.environ.get("AWS_PROFILE")
+    aws_args = ["sts", "get-caller-identity"]
+    if profile_env:
+        aws_args += ["--profile", profile_env]
+
+    try:
+        identity = json.loads(run_aws(aws_args))
+    except GssoError as error:
+        lowered = str(error).lower()
+        if "sso token" in lowered or "sso session" in lowered:
+            raise GssoError(str(error), EX_AUTH, "run `gsso login`") from error
+        if "could not be found" in lowered and "profile" in lowered:
+            raise GssoError(
+                str(error), EX_FAIL, "run `gsso list` to see valid profile names"
+            ) from error
+        raise
+
+    account_id = identity.get("Account", "")
+    arn = identity.get("Arn", "")
+    user_id = identity.get("UserId", "")
+
+    if profile_env:
+        label = f"{profile_env}  (from AWS_PROFILE)"
+        block = ConfigFile(CONFIG_PATH).section(f"profile {profile_env}")
+    else:
+        label = "[default]  (AWS_PROFILE is not set in this shell)"
+        block = ConfigFile(CONFIG_PATH).section("default")
+
+    role_name = block.get("sso_role_name") if block else None
+    account_name = (
+        block.comment_value(ACCOUNT_NAME_KEY) if block else None
+    ) or find_account_name(account_id)
+
+    print(f"Profile:  {label}")
+    print(f"Account:  {account_name + ' ' if account_name else ''}({account_id})")
+    if role_name:
+        print(f"Role:     {role_name}")
+    elif not account_name:
+        print("Note:     not a profile gsso manages; showing raw AWS identity only")
+    print(f"ARN:      {arn}")
+    print(f"User ID:  {user_id}")
+    return EX_OK
+
+
+SHELL_FUNCTION = """\
+gsso() {
+  case "$1" in
+    switch)
+      shift
+      __gsso_out="$(command gsso switch --shell posix "$@")" || return $?
+      if [ -n "$__gsso_out" ]; then
+        eval "$__gsso_out"
+      fi
+      unset __gsso_out
+      ;;
+    *)
+      command gsso "$@"
+      ;;
+  esac
+}
+
+_gsso_complete() {
+  local cur words cword candidates
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  words=("${COMP_WORDS[@]:1}")
+  cword=$((COMP_CWORD - 1))
+  candidates="$(command gsso __complete "$cword" "${words[@]}" 2>/dev/null)"
+  COMPREPLY=($(compgen -W "$candidates" -- "$cur"))
+}
+complete -F _gsso_complete gsso
+"""
+
+# zsh has no native bash-style `complete`/COMP_WORDS. bashcompinit provides a
+# compatibility shim so the exact same completion function works unchanged,
+# but bashcompinit's `complete` itself calls `compdef`, which only exists
+# once zsh's own completion system has been initialized. Most interactive
+# zsh setups already call `compinit` (directly, or via a framework), but it
+# is not guaranteed, so it is initialized here too if missing. Calling it a
+# second time is harmless; zsh reuses its cached dump file.
+ZSH_COMPLETION_PREAMBLE = """\
+if ! whence compdef >/dev/null 2>&1; then
+  autoload -Uz compinit
+  compinit
+fi
+autoload -Uz bashcompinit
+bashcompinit
+"""
+
+
+def cmd_shell_init(args: argparse.Namespace) -> int:
+    if args.shell not in ("bash", "zsh"):
+        raise GssoError(f"unsupported shell: {args.shell}")
+    body = SHELL_FUNCTION
+    if args.shell == "zsh":
+        body = ZSH_COMPLETION_PREAMBLE + body
+    print(body, end="")
+    return EX_OK
+
+
+# --------------------------------------------------------------------------
+# Shell completion
+#
+# `gsso __complete <cword> [word ...]` is a hidden subcommand invoked by the
+# shell function above on every TAB press. It must never make a network call
+# or block: candidates come only from local files (config, credentials, the
+# portal cache), and any error is swallowed so a bad TAB never breaks typing.
+# --------------------------------------------------------------------------
+
+SUBCOMMANDS = ["login", "list", "add", "remove", "switch", "whoami", "shell-init"]
+LOGIN_FLAGS = ["--use-device-code", "--no-browser"]
+LIST_FLAGS = ["--remote", "--hard-refresh", "--hard"]
+ADD_FLAGS = ["--hard-refresh", "--hard"]
+SWITCH_FLAGS = ["--set-default", "--shell"]
+
+
+def completion_switch_targets() -> List[str]:
+    try:
+        names = [p.name for p in read_config_profiles()] + read_credentials_profile_names()
+        return sorted({n for n in names if n != "default"})
+    except Exception:
+        return []
+
+
+def completion_managed_profiles() -> List[str]:
+    try:
+        return sorted(p.name for p in read_config_profiles() if p.managed)
+    except Exception:
+        return []
+
+
+def completion_add_targets() -> List[str]:
+    """Unconfigured account/role pairs from the portal cache. Never queries live."""
+    try:
+        cached = read_portal_cache()
+        if cached is None:
+            return []
+        _fetched, pairs = cached
+        configured = {(p.account_id, p.role_name) for p in read_config_profiles()}
+        return sorted(
+            f"{name}/{role}"
+            for account_id, name, role in pairs
+            if (account_id, role) not in configured
+        )
+    except Exception:
+        return []
+
+
+def complete_candidates(words: List[str], cword: int) -> List[str]:
+    if cword == 0:
+        return SUBCOMMANDS
+
+    sub = words[0] if words else ""
+    already = set(words[1:cword])
+
+    if sub == "switch":
+        prev = words[cword - 1] if cword >= 1 else ""
+        if prev == "--shell":
+            return ["posix", "powershell"]
+        if cword == 1:
+            return completion_switch_targets() + SWITCH_FLAGS
+        return SWITCH_FLAGS
+
+    if sub == "remove":
+        return [p for p in completion_managed_profiles() if p not in already]
+
+    if sub == "add":
+        return [c for c in completion_add_targets() if c not in already] + ADD_FLAGS
+
+    if sub == "list":
+        return LIST_FLAGS
+
+    if sub == "shell-init":
+        return ["bash", "zsh"] if cword == 1 else []
+
+    if sub == "login":
+        return LOGIN_FLAGS
+
+    return []
+
+
+def cmd_complete(raw_args: Sequence[str]) -> int:
+    if not raw_args:
+        return EX_OK
+    try:
+        cword = int(raw_args[0])
+    except ValueError:
+        return EX_OK
+    words = list(raw_args[1:])
+    try:
+        candidates = complete_candidates(words, cword)
+    except Exception:
+        candidates = []
+    for candidate in candidates:
+        print(candidate)
+    return EX_OK
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gsso", description="24G AWS SSO profile helper"
+    )
+    parser.add_argument("--version", action="version", version=f"gsso {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_login = sub.add_parser("login", help="renew the 24G SSO session")
+    p_login.add_argument(
+        "extra",
+        nargs="*",
+        metavar="...",
+        help="passed through to `aws sso login`, e.g. --use-device-code",
+    )
+    p_login.set_defaults(func=cmd_login)
+
+    p_list = sub.add_parser("list", help="list profiles grouped by account")
+    p_list.add_argument(
+        "--remote", action="store_true", help="list what the portal reports instead"
+    )
+    p_list.add_argument(
+        "--hard-refresh",
+        "--hard",
+        action="store_true",
+        dest="hard_refresh",
+        help="re-query Identity Center and rewrite the portal cache (implies --remote)",
+    )
+    p_list.set_defaults(func=cmd_list)
+
+    p_add = sub.add_parser("add", help="create managed profiles")
+    p_add.add_argument("targets", nargs="*", metavar="ACCOUNT/ROLE")
+    p_add.add_argument(
+        "--hard-refresh",
+        "--hard",
+        action="store_true",
+        dest="hard_refresh",
+        help="re-query Identity Center before adding, instead of using the portal cache",
+    )
+    p_add.set_defaults(func=cmd_add)
+
+    p_remove = sub.add_parser("remove", help="delete managed profiles")
+    p_remove.add_argument("profiles", nargs="*", metavar="PROFILE")
+    p_remove.set_defaults(func=cmd_remove)
+
+    p_whoami = sub.add_parser(
+        "whoami", help="show which profile and identity are currently active"
+    )
+    p_whoami.set_defaults(func=cmd_whoami)
+
+    p_switch = sub.add_parser("switch", help="set AWS_PROFILE for this shell")
+    p_switch.add_argument("profile", nargs="?")
+    p_switch.add_argument(
+        "--set-default", action="store_true", help="also mirror into [default]"
+    )
+    p_switch.add_argument("--shell", choices=("posix", "powershell"), default="posix")
+    p_switch.set_defaults(func=cmd_switch)
+
+    p_init = sub.add_parser(
+        "shell-init", help="print the shell wrapper and tab completion for eval"
+    )
+    p_init.add_argument("shell", choices=("bash", "zsh"))
+    p_init.set_defaults(func=cmd_shell_init)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "__complete":
+        # Bypasses argparse entirely: not a public command, must never fail
+        # loudly or touch the network, and must not appear in --help.
+        return cmd_complete(argv[1:])
+    parser = build_parser()
+    if argv and argv[0] == "login" and not {"-h", "--help"} & set(argv):
+        # `login` forwards its options to `aws sso login`, so they must not
+        # reach argparse, which would reject them as unknown.
+        args = parser.parse_args(["login"])
+        args.extra = argv[1:]
+    else:
+        args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except GssoError as error:
+        err(f"gsso: {error}")
+        if error.fix:
+            err(f"  fix: {error.fix}")
+        return error.code
+    except KeyboardInterrupt:
+        err("\ngsso: cancelled")
+        return EX_FAIL
+    except subprocess.CalledProcessError as error:
+        err(f"gsso: a command failed: {' '.join(map(str, error.cmd))}")
+        return EX_FAIL
+    except Exception as error:  # no traceback: a frame could hold the access token
+        err(f"gsso: unexpected {type(error).__name__}: {error}")
+        if os.environ.get("GSSO_DEBUG"):
+            raise
+        err("  set GSSO_DEBUG=1 for a traceback")
+        return EX_FAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
