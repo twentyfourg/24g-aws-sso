@@ -1,8 +1,8 @@
 # Set Up Local AWS Configuration and Credentials for 24G
 
 <!-- semantic-release-version-start -->
-Version: 1.0.0
-Updated: 2026-09-21
+Version: 1.1.0
+Updated: 2026-10-30
 <!-- semantic-release-version-end -->
 Repository: <https://github.com/twentyfourg/24g-aws-sso>
 
