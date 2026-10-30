@@ -6,7 +6,7 @@ import (
 )
 
 // semantic-release-version-start
-const Version = "1.0.0"
+const Version = "1.0.1"
 
 // semantic-release-version-end
 
