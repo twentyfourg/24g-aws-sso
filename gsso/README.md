@@ -13,8 +13,8 @@ call shells out to the CLI.
 ## Install
 
 Run the command for your platform. It downloads the latest release for your
-CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook. Run it
-again to upgrade; it does not add duplicate lines.
+CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook. The
+same command updates an existing install; see [Update](#update).
 
 <details>
 <summary>macOS / Linux (bash or zsh)</summary>
@@ -61,6 +61,21 @@ Without the hook, `gsso switch` in a terminal exits and leaves `AWS_PROFILE`
 unchanged.
 
 Menus need an interactive terminal. Passing the names as arguments does not.
+
+### Update
+
+Run the same install command again. It replaces the binary with the latest
+release and reports what happened:
+
+- `Updated gsso 1.0.0 -> 1.0.1.` Open a new terminal so the shell loads the
+  updated hook.
+- `gsso 1.0.1 is already the latest release.` Nothing changed.
+
+It never adds a second `PATH` or hook line. If the download fails, the
+installed version is left in place and keeps working. If it warns that another
+`gsso` comes before it on `PATH` (for example an old `go build` copy), remove
+that copy or the update has no effect. `gsso --version` shows which version
+runs.
 
 ### Build from source
 

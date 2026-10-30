@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Installs the latest gsso release to ~/.local/bin and registers the shell hook.
+# Installs or updates gsso to the latest release in ~/.local/bin and registers the shell hook.
 #   curl -fsSL https://raw.githubusercontent.com/twentyfourg/24g-aws-sso/main/gsso/install.sh | bash
 set -eu
 
+tmp=""
+trap 'rm -f "$tmp"' EXIT
+
 main() {
-  local os arch url sh rc
+  local os arch url sh rc old="" new found
+  local bin="$HOME/.local/bin/gsso"
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   case "$(uname -m)" in
     x86_64 | amd64) arch=amd64 ;;
@@ -16,9 +20,25 @@ main() {
     grep -o "https://[^\"]*/gsso-$os-$arch\"" | sed -n '1s/"$//p')
   [ -n "$url" ] || { echo "No gsso release found for $os-$arch" >&2; exit 1; }
 
+  if [ -x "$bin" ]; then
+    old=$("$bin" --version 2>/dev/null || true)
+    old=${old##* }
+  fi
+
+  # Download beside the binary and rename over it, so a failed download leaves
+  # the old binary intact and a running gsso does not block the update.
   mkdir -p "$HOME/.local/bin"
-  curl -fsSL "$url" -o "$HOME/.local/bin/gsso"
-  chmod 755 "$HOME/.local/bin/gsso"
+  tmp=$(mktemp "$HOME/.local/bin/.gsso.XXXXXX")
+  curl -fsSL "$url" -o "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$bin"
+  new=$("$bin" --version)
+  new=${new##* }
+
+  found=$(command -v gsso || true)
+  if [ -n "$found" ] && [ "$found" != "$bin" ]; then
+    echo "Warning: $found comes before $bin on PATH, so this shell still runs that one." >&2
+  fi
 
   case "$(basename "$SHELL")" in
     zsh) sh=zsh rc="$HOME/.zshrc" ;;
@@ -32,7 +52,13 @@ main() {
   esac
   grep -qF 'gsso shell-init' "$rc" || echo "eval \"\$(gsso shell-init $sh)\"" >> "$rc"
 
-  echo "Installed $("$HOME/.local/bin/gsso" --version) to ~/.local/bin. Open a new terminal."
+  if [ -z "$old" ]; then
+    echo "Installed gsso $new to ~/.local/bin. Open a new terminal."
+  elif [ "$old" = "$new" ]; then
+    echo "gsso $new is already the latest release."
+  else
+    echo "Updated gsso $old -> $new. Open a new terminal to load the updated hook."
+  fi
 }
 
 main

@@ -310,7 +310,7 @@ A single binary for macOS, Linux, and Windows. AWS CLI v2 must be on `PATH`. Bui
 
 ### Install
 
-Run the command for your platform. It downloads the latest release for your CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook that `gsso switch` needs to set `AWS_PROFILE`. Run it again to upgrade. Then open a new terminal.
+Run the command for your platform. It downloads the latest release for your CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook that `gsso switch` needs to set `AWS_PROFILE`. Then open a new terminal.
 
 <details>
 <summary>macOS / Linux (bash or zsh)</summary>
@@ -331,6 +331,10 @@ irm https://raw.githubusercontent.com/twentyfourg/24g-aws-sso/main/gsso/install.
 </details>
 
 Install paths, building from source, and registering the hook by hand: [`gsso/README.md`](gsso/README.md#install).
+
+### Update
+
+Run the same install command again. It replaces `gsso` with the latest release and prints `Updated gsso <old> -> <new>`, or that it is already the latest. Open a new terminal afterwards so the shell loads the updated hook. Details: [`gsso/README.md`](gsso/README.md#update).
 
 ### Everyday use
 
