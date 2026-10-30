@@ -750,15 +750,49 @@ The `rmdir` removes the parent only when it is empty, so backups from earlier ru
 
 ## Step 12: Optional `gsso` helper commands
 
-Specified but not yet built. See [`gsso/24GCLISpec.md`](../gsso/24GCLISpec.md).
+`gsso` is optional. Every profile written by Step 9 already works with `aws --profile <name>`. Offer it; skip the rest of this step if the user does not want it.
 
-When it exists, this step will offer to install an optional `gsso` script providing `login`, `list`, `add`, `remove`, and `switch`. It is genuinely optional: every profile written by Step 9 already works with plain `aws --profile <name>`.
-
-For now, skip this step. Tell the user the setup is complete and that profile switching is done with `--profile` or by exporting `AWS_PROFILE` themselves:
+If they do want it, putting `gsso` on `PATH` is not enough. `gsso switch` runs as a child process and cannot export `AWS_PROFILE` into the shell that started it. The shell must load the hook on startup:
 
 ```bash
-export AWS_PROFILE=example-prod-ViewOnlyAccess
+eval "$(gsso shell-init bash)"    # or zsh
 ```
+
+Without that line, `gsso switch` does not change the session. Do not tell the user to export `AWS_PROFILE` by hand instead.
+
+Install instructions: [`gsso`](../gsso/README.md#install). `command -v gsso` must succeed before the hook is registered. Do not append the hook line if `gsso` is not on `PATH`; every new shell would fail on startup.
+
+**macOS / Linux.** Bash and zsh only. If `$SHELL` is something else, stop and say so. Append the line once, then load it in this session:
+
+```bash
+case "$(basename "$SHELL")" in
+  zsh) GSSO_SHELL=zsh; SHELL_RC="$HOME/.zshrc" ;;
+  bash) GSSO_SHELL=bash; SHELL_RC="$HOME/.bashrc" ;;
+  *) echo "gsso shell-init supports bash and zsh. This shell is $SHELL."; false ;;
+esac && {
+  touch "$SHELL_RC"
+  LINE="eval \"\$(gsso shell-init ${GSSO_SHELL})\""
+  grep -qF "$LINE" "$SHELL_RC" || echo "$LINE" >> "$SHELL_RC"
+  eval "$(gsso shell-init "$GSSO_SHELL")"
+}
+```
+
+The shell rc file is already in the rollback point from the start of the run, so a rollback removes this line along with any other edits from this run.
+
+**Windows (PowerShell).** The PowerShell profile is not in the rollback point; say that before editing it. Removing the line later is manual.
+
+```powershell
+$dir = Split-Path $PROFILE
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Force -Path $PROFILE | Out-Null }
+$Line = 'gsso shell-init powershell | Out-String | Invoke-Expression'
+if (-not (Select-String -LiteralPath $PROFILE -SimpleMatch $Line -Quiet)) {
+  Add-Content -LiteralPath $PROFILE -Value $Line
+}
+gsso shell-init powershell | Out-String | Invoke-Expression
+```
+
+**Success:** The startup file contains exactly one hook line, and this session has `GSSO_SHELL_HOOK=1` (PowerShell: `$env:GSSO_SHELL_HOOK` equals `1`). Then `gsso switch <profile>` sets `AWS_PROFILE` in this shell.
 
 ---
 
