@@ -52,6 +52,11 @@ gsso() {
 }
 `
 
+// The zsh completion script ends with compdef, which only exists after
+// compinit. A default macOS zsh never runs compinit.
+const zshCompinitGuard = `(( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }
+`
+
 const powershellWrapper = `function global:__gsso_apply_profile {
     $file = Join-Path $HOME ".aws/gsso/sessions/$PID"
     if (-not (Test-Path -LiteralPath $file)) { return }
@@ -102,6 +107,7 @@ func (a *App) shellInitCmd() *cobra.Command {
 				return root.GenBashCompletionV2(os.Stdout, true)
 			case "zsh":
 				os.Stdout.WriteString(bashZshWrapper)
+				os.Stdout.WriteString(zshCompinitGuard)
 				return root.GenZshCompletion(os.Stdout)
 			case "powershell":
 				os.Stdout.WriteString(powershellWrapper)

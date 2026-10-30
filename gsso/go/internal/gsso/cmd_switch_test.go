@@ -91,6 +91,25 @@ func TestSwitchWithoutHookRefusesToPretend(t *testing.T) {
 	}
 }
 
+func TestSwitchHelpStaysOffStdout(t *testing.T) {
+	paths := switchTestPaths(t)
+
+	stdout, stderr, err := captureStd(t, func() error {
+		root := NewApp(paths).RootCommand()
+		root.SetArgs([]string{"switch", "--shell", "posix", "--help"})
+		return root.Execute()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if !strings.Contains(stderr, "Usage:") {
+		t.Fatalf("stderr = %q", stderr)
+	}
+}
+
 func TestShellInitFixUsesShell(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	if got := shellInitFix("posix"); !strings.Contains(got, "shell-init zsh") {
@@ -109,6 +128,22 @@ func TestShellInitWrapperExportsHook(t *testing.T) {
 	}
 	if !strings.Contains(bashZshWrapper, "PROMPT_COMMAND") {
 		t.Fatal("bash wrapper missing PROMPT_COMMAND")
+	}
+}
+
+func TestShellInitZshLoadsCompinitBeforeCompdef(t *testing.T) {
+	stdout, _, err := captureStd(t, func() error {
+		root := NewApp(NewPaths(t.TempDir())).RootCommand()
+		root.SetArgs([]string{"shell-init", "zsh"})
+		return root.Execute()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := strings.Index(stdout, "compinit")
+	compdef := strings.Index(stdout, "compdef _gsso gsso")
+	if guard < 0 || compdef < 0 || guard > compdef {
+		t.Fatalf("compinit guard at %d, compdef at %d", guard, compdef)
 	}
 }
 

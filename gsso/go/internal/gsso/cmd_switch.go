@@ -49,6 +49,8 @@ func (a *App) switchCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&setDefault, "set-default", false, "also mirror into [default]")
 	cmd.Flags().StringVar(&shell, "shell", "posix", "posix or powershell")
+	// The shell wrapper evals switch's stdout, so help text must not go there.
+	cmd.SetOut(os.Stderr)
 	return cmd
 }
 
