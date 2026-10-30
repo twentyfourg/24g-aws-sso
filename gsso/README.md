@@ -7,33 +7,116 @@ updates AWS MCP allowlists.
 `gsso` never writes access keys and never writes `~/.aws/credentials`. It only
 edits `~/.aws/config` (SSO) and detected agent MCP configs.
 
-The script is [`python/gsso`](python/gsso). Standard library only. AWS CLI v2
-must already be on `PATH`.
+It is a single binary in [`go/`](go). AWS CLI v2 must be on `PATH`. Every AWS
+call shells out to the CLI.
 
 ## Install
 
-Put `gsso` on `PATH`. One option:
+Paste the command for your platform. It downloads the latest release for your
+CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook. Run it
+again to upgrade; it does not add duplicate lines.
+
+<details>
+<summary>macOS / Linux (bash or zsh)</summary>
 
 ```bash
-install -m 755 python/gsso "$HOME/.local/bin/gsso"
+(
+  set -eu
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    arm64 | aarch64) arch=arm64 ;;
+    *) echo "Unsupported CPU: $(uname -m)" >&2; exit 1 ;;
+  esac
+  url=$(curl -fsSL "https://api.github.com/repos/twentyfourg/24g-aws-sso/releases?per_page=100" |
+    grep -o "https://[^\"]*/gsso-$os-$arch\"" | sed -n '1s/"$//p')
+  [ -n "$url" ] || { echo "No gsso release found for $os-$arch" >&2; exit 1; }
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL "$url" -o "$HOME/.local/bin/gsso"
+  chmod 755 "$HOME/.local/bin/gsso"
+  case "$(basename "$SHELL")" in
+    zsh) sh=zsh rc="$HOME/.zshrc" ;;
+    bash) sh=bash rc="$HOME/.bashrc" ;;
+    *) echo "Installed. The shell hook supports bash and zsh, not $SHELL." >&2; exit 0 ;;
+  esac
+  touch "$rc"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) grep -qF '$HOME/.local/bin' "$rc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc" ;;
+  esac
+  grep -qF 'gsso shell-init' "$rc" || echo "eval \"\$(gsso shell-init $sh)\"" >> "$rc"
+  echo "Installed $("$HOME/.local/bin/gsso" --version) to ~/.local/bin. Open a new terminal."
+)
 ```
 
-Then add a shell wrapper so `gsso switch` actually exports `AWS_PROFILE` in the
-current shell, and so TAB completion works:
+Installs to `~/.local/bin/gsso`. Adds `~/.local/bin` to `PATH` (if it is not
+already) and the hook line to `~/.zshrc` or `~/.bashrc`.
+
+</details>
+
+<details>
+<summary>Windows (PowerShell)</summary>
+
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'
+  $ProgressPreference = 'SilentlyContinue'
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+  $asset = (Invoke-RestMethod 'https://api.github.com/repos/twentyfourg/24g-aws-sso/releases?per_page=100').assets |
+    Where-Object name -eq "gsso-windows-$arch.exe" | Select-Object -First 1
+  if (-not $asset) { throw "No gsso release found for windows-$arch" }
+  $dir = Join-Path $env:LOCALAPPDATA 'Programs\gsso'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile (Join-Path $dir 'gsso.exe')
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (($userPath -split ';') -notcontains $dir) {
+    [Environment]::SetEnvironmentVariable('Path', "$userPath;$dir".TrimStart(';'), 'User')
+  }
+  if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Force -Path $PROFILE | Out-Null }
+  $line = 'gsso shell-init powershell | Out-String | Invoke-Expression'
+  if (-not (Select-String -LiteralPath $PROFILE -SimpleMatch $line -Quiet)) {
+    Add-Content -LiteralPath $PROFILE -Value $line
+  }
+  Write-Host "Installed $(& (Join-Path $dir 'gsso.exe') --version) to $dir. Open a new terminal."
+}
+```
+
+Installs to `%LOCALAPPDATA%\Programs\gsso\gsso.exe`. Adds that directory to
+the user `PATH` and the hook line to `$PROFILE`. If the new terminal reports
+that running scripts is disabled, PowerShell's execution policy is blocking
+`$PROFILE`; `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` allows it.
+
+</details>
+
+The shell hook is required. `gsso switch` cannot export `AWS_PROFILE` into the
+shell that started it, so every new shell must load the hook. To register it by
+hand instead:
 
 ```bash
-# bash
-echo 'eval "$(gsso shell-init bash)"' >> ~/.bashrc
-
-# zsh
-echo 'eval "$(gsso shell-init zsh)"' >> ~/.zshrc
+eval "$(gsso shell-init bash)"                         # ~/.bashrc
+eval "$(gsso shell-init zsh)"                          # ~/.zshrc
+gsso shell-init powershell | Out-String | Invoke-Expression   # $PROFILE
 ```
 
-Without the wrapper, `gsso switch` prints `export AWS_PROFILE=...` and you have
-to eval it yourself.
+Open a new terminal after installing and `gsso switch PROFILE` sets
+`AWS_PROFILE`. A path such as `./gsso switch` skips the function; the same hook
+still applies the profile before the next prompt.
 
-Requires macOS or Linux with an interactive TTY for menus. Python 3.9+ is
-enough.
+Without the hook, `gsso switch` in a terminal exits and leaves `AWS_PROFILE`
+unchanged.
+
+Menus need an interactive terminal. Passing the names as arguments does not.
+
+### Build from source
+
+```bash
+cd gsso/go
+go build -o gsso ./cmd/gsso                              # macOS/Linux
+GOOS=windows GOARCH=amd64 go build -o gsso.exe ./cmd/gsso
+install -m 755 gsso "$HOME/.local/bin/gsso"
+```
+
+Then register the shell hook as above.
 
 ## Everyday use
 
@@ -41,7 +124,7 @@ enough.
 gsso login
 gsso list
 gsso configure
-eval "$(gsso switch --shell posix acme-read)"   # or just: gsso switch acme-read
+gsso switch acme-read
 gsso whoami
 ```
 
@@ -56,9 +139,11 @@ Renew the 24G SSO session. Does not create or change profiles.
 
 ### `gsso list`
 
-List managed profiles grouped by account. Marks the current `AWS_PROFILE`. Also
-shows unmanaged config profiles and static credential profiles, without touching
-them.
+Print managed profiles as a table: account, account id, profile, role, and
+which profile this shell will use. `*` is `AWS_PROFILE`, or the profile that
+matches `[default]` when that variable is unset. `default` marks a profile
+whose account and role match `[default]`. Unmanaged config profiles are listed
+separately and are not modified.
 
 ```bash
 gsso list              # local ~/.aws/config
@@ -120,8 +205,12 @@ gsso remove lxp-base
 
 ### `gsso switch [PROFILE]`
 
-Print an export for `AWS_PROFILE` (or a PowerShell assignment with
-`--shell powershell`). With the shell wrapper, the current shell is updated.
+Set `AWS_PROFILE` in the current shell. With the shell hook loaded, `gsso
+switch` evals the export immediately. A path invocation queues the profile
+and the hook exports it before the next prompt. Without the hook, a terminal
+run tells you to load `shell-init` and leaves the variable unchanged. Stdout
+is still only the export line when something is capturing it
+(`eval "$(gsso switch PROFILE)"`).
 
 `--set-default` also copies the chosen profile's SSO keys into `[default]`.
 That is refused if `~/.aws/credentials` already has a `[default]` unless you
@@ -172,17 +261,13 @@ Generated profile names:
 
 ## Menus
 
-On a POSIX TTY:
+Interactive menus use a checkbox or single-select. Type to filter. Space
+toggles, Enter confirms, Esc cancels.
 
-- Up / Down move
-- Space toggles
-- `/` starts a name search (Enter finishes, Esc clears)
-- `d` marks the MCP default (`mcp add` only)
-- Enter confirms
-- Esc or `q` cancels
+`gsso mcp add` with no arguments is two steps: choose the profiles, then (if
+more than one is selected) choose which of those is the default.
 
-Limited terminals fall back to numbered multi-select (`1,3-4`, and `d3` for a
-default). Non-interactive shells require the names as arguments.
+Without a terminal, pass the names as arguments.
 
 ## Cache and rollback
 
@@ -196,8 +281,7 @@ those files back. `gsso` does not delete backups.
 
 ## Tests
 
-From the repository root:
-
 ```bash
-python3 -m unittest gsso/python/test_gsso.py
+cd gsso/go
+go test ./...
 ```

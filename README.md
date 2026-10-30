@@ -306,25 +306,77 @@ aws agent-toolkit add-skill \
 
 An optional helper for 24G AWS SSO profiles. `gsso` switches `AWS_PROFILE`, adds and removes named profiles in `~/.aws/config` without hand-editing it, and updates every detected agent's MCP allowlist at once instead of editing each agent's config file.
 
-Requires macOS or Linux with an interactive TTY, AWS CLI v2 on `PATH`, and Python 3.9+.
+A single binary for macOS, Linux, and Windows. AWS CLI v2 must be on `PATH`. Build and command reference: [`gsso/README.md`](gsso/README.md).
 
 ### Install
 
-Put `gsso` on `PATH`:
+Paste the command for your platform. It downloads the latest release for your CPU (amd64 or arm64), puts it on `PATH`, and registers the shell hook that `gsso switch` needs to set `AWS_PROFILE`. Run it again to upgrade. Then open a new terminal.
+
+<details>
+<summary>macOS / Linux (bash or zsh)</summary>
 
 ```bash
-install -m 755 gsso/python/gsso "$HOME/.local/bin/gsso"
+(
+  set -eu
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    arm64 | aarch64) arch=arm64 ;;
+    *) echo "Unsupported CPU: $(uname -m)" >&2; exit 1 ;;
+  esac
+  url=$(curl -fsSL "https://api.github.com/repos/twentyfourg/24g-aws-sso/releases?per_page=100" |
+    grep -o "https://[^\"]*/gsso-$os-$arch\"" | sed -n '1s/"$//p')
+  [ -n "$url" ] || { echo "No gsso release found for $os-$arch" >&2; exit 1; }
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL "$url" -o "$HOME/.local/bin/gsso"
+  chmod 755 "$HOME/.local/bin/gsso"
+  case "$(basename "$SHELL")" in
+    zsh) sh=zsh rc="$HOME/.zshrc" ;;
+    bash) sh=bash rc="$HOME/.bashrc" ;;
+    *) echo "Installed. The shell hook supports bash and zsh, not $SHELL." >&2; exit 0 ;;
+  esac
+  touch "$rc"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) grep -qF '$HOME/.local/bin' "$rc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc" ;;
+  esac
+  grep -qF 'gsso shell-init' "$rc" || echo "eval \"\$(gsso shell-init $sh)\"" >> "$rc"
+  echo "Installed $("$HOME/.local/bin/gsso" --version) to ~/.local/bin. Open a new terminal."
+)
 ```
 
-Add a shell wrapper so `gsso switch` exports `AWS_PROFILE` in the current shell and so TAB completion works:
+</details>
 
-```bash
-# bash
-echo 'eval "$(gsso shell-init bash)"' >> ~/.bashrc
+<details>
+<summary>Windows (PowerShell)</summary>
 
-# zsh
-echo 'eval "$(gsso shell-init zsh)"' >> ~/.zshrc
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'
+  $ProgressPreference = 'SilentlyContinue'
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+  $asset = (Invoke-RestMethod 'https://api.github.com/repos/twentyfourg/24g-aws-sso/releases?per_page=100').assets |
+    Where-Object name -eq "gsso-windows-$arch.exe" | Select-Object -First 1
+  if (-not $asset) { throw "No gsso release found for windows-$arch" }
+  $dir = Join-Path $env:LOCALAPPDATA 'Programs\gsso'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile (Join-Path $dir 'gsso.exe')
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (($userPath -split ';') -notcontains $dir) {
+    [Environment]::SetEnvironmentVariable('Path', "$userPath;$dir".TrimStart(';'), 'User')
+  }
+  if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Force -Path $PROFILE | Out-Null }
+  $line = 'gsso shell-init powershell | Out-String | Invoke-Expression'
+  if (-not (Select-String -LiteralPath $PROFILE -SimpleMatch $line -Quiet)) {
+    Add-Content -LiteralPath $PROFILE -Value $line
+  }
+  Write-Host "Installed $(& (Join-Path $dir 'gsso.exe') --version) to $dir. Open a new terminal."
+}
 ```
+
+</details>
+
+Install paths, building from source, and registering the hook by hand: [`gsso/README.md`](gsso/README.md#install).
 
 ### Everyday use
 
