@@ -1,0 +1,20 @@
+extends: semantic-release-monorepo
+branches:
+  - main
+tagFormat: "gsso/go/v${version}"
+plugins:
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+  - "@semantic-release/changelog"
+  - - "@semantic-release/exec"
+    - prepareCmd: "python3 ../../.github/scripts/update-release-versions.py gsso ${nextRelease.version} && ../../.github/scripts/build-gsso.sh"
+  - - "@semantic-release/git"
+    - assets:
+        - CHANGELOG.md
+        - internal/gsso/paths.go
+      message: "chore(release): gsso ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+  - - "@semantic-release/github"
+    - assets:
+        - dist/*

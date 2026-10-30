@@ -19,14 +19,21 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22.x"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: gsso/go/go.mod
+          cache-dependency-path: gsso/go/go.sum
       - name: Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          npx --yes \
-            --package semantic-release@25.0.9 \
-            --package conventional-changelog-conventionalcommits@9.3.1 \
-            --package @semantic-release/changelog@7.0.0 \
-            --package @semantic-release/exec@7.1.0 \
-            --package @semantic-release/git@11.0.1 \
-            semantic-release
+          for package in gsso/go setup-instructions; do
+            (cd "$package" && npx --yes \
+              --package semantic-release@25.0.9 \
+              --package semantic-release-monorepo@8.0.2 \
+              --package conventional-changelog-conventionalcommits@9.3.1 \
+              --package @semantic-release/changelog@7.0.0 \
+              --package @semantic-release/exec@7.1.0 \
+              --package @semantic-release/git@11.0.1 \
+              semantic-release)
+          done

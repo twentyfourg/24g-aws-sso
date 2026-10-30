@@ -1,0 +1,19 @@
+extends: semantic-release-monorepo
+branches:
+  - main
+tagFormat: "setup-instructions-v${version}"
+plugins:
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+  - "@semantic-release/changelog"
+  - - "@semantic-release/exec"
+    - prepareCmd: "python3 ../.github/scripts/update-release-versions.py setup-instructions ${nextRelease.version}"
+  - - "@semantic-release/git"
+    - assets:
+        - CHANGELOG.md
+        - 24GAWSMCPSetup.md
+        - 24GAWSSOSetup.md
+      message: "chore(release): setup-instructions ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+  - "@semantic-release/github"

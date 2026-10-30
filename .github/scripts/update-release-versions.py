@@ -8,10 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-GSSO_FILE = ROOT / "gsso" / "python" / "gsso"
+GSSO_FILE = ROOT / "gsso" / "go" / "internal" / "gsso" / "paths.go"
 GSSO_PATTERN = re.compile(
-    r'(?m)(^# semantic-release-version-start\nVERSION = ")[^"]+'
-    r'("\n# semantic-release-version-end$)'
+    r'(?m)(^// semantic-release-version-start\nconst Version = ")[^"]+'
+    r'("\n\n// semantic-release-version-end$)'
 )
 
 SETUP_FILES = [
@@ -36,13 +36,18 @@ def replace_once(path: Path, pattern: re.Pattern[str], replacement: str) -> None
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {Path(sys.argv[0]).name} <version>")
+    if len(sys.argv) != 3 or sys.argv[1] not in ("gsso", "setup-instructions"):
+        raise SystemExit(
+            f"usage: {Path(sys.argv[0]).name} gsso|setup-instructions <version>"
+        )
 
-    version = sys.argv[1]
+    package, version = sys.argv[1], sys.argv[2]
     today = date.today().isoformat()
 
-    replace_once(GSSO_FILE, GSSO_PATTERN, rf"\g<1>{version}\g<2>")
+    if package == "gsso":
+        replace_once(GSSO_FILE, GSSO_PATTERN, rf"\g<1>{version}\g<2>")
+        return
+
     for path in SETUP_FILES:
         replace_once(
             path,
