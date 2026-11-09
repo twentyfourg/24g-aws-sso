@@ -46,11 +46,14 @@ main() {
     *) echo "Installed. The shell hook supports bash and zsh, not $SHELL." >&2; exit 0 ;;
   esac
   touch "$rc"
+  # Skip comment lines so a commented mention of the path or hook is not
+  # treated as configuration. Any amount of leading whitespace still counts.
+  rc_without_comments() { grep -v '^[[:space:]]*#' "$rc"; }
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
-    *) grep -qF '$HOME/.local/bin' "$rc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc" ;;
+    *) rc_without_comments | grep -qF '.local/bin' || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc" ;;
   esac
-  grep -qF 'gsso shell-init' "$rc" || echo "eval \"\$(gsso shell-init $sh)\"" >> "$rc"
+  rc_without_comments | grep -qF 'gsso shell-init' || echo "eval \"\$(gsso shell-init $sh)\"" >> "$rc"
 
   if [ -z "$old" ]; then
     echo "Installed gsso $new to ~/.local/bin. Open a new terminal."
